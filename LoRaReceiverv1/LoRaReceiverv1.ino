@@ -18,6 +18,13 @@ const int      FONT_PX          = 10;    // 10 ~20 chars/line, 16 ~12, 24 ~8
 const bool     WRAP_TEXT        = true;  // false = each message starts on new line
 // ----------------------------------------
 
+// ---------- ENCODER PINS FOR SCROLLING ----------
+const int pinA = 40;  // CLK pin
+const int pinB = 4;   // DT pin
+
+volatile int scrollOffset = 0;  // Scroll position (lines to offset)
+volatile int lastEncoded = 0;
+
 // Heltec V3 SX1262 pins
 SX1262 radio = new Module(/*cs*/8, /*irq(DIO1)*/14, /*rst*/12, /*busy*/13);
 
@@ -34,6 +41,20 @@ static SSD1306Wire display(0x3c, 500000, SDA_OLED, SCL_OLED,
 
 void VextON()  { pinMode(Vext, OUTPUT); digitalWrite(Vext, LOW);  }
 void VextOFF() { pinMode(Vext, OUTPUT); digitalWrite(Vext, HIGH); }
+
+// ---------- ENCODER ISR FOR SCROLLING ----------
+void IRAM_ATTR handleEncoder() {
+  int MSB = digitalRead(pinA);  // MSB = most significant bit
+  int LSB = digitalRead(pinB);  // LSB = least significant bit
+
+  int encoded = (MSB << 1) | LSB;
+  int sum = (lastEncoded << 2) | encoded;
+
+  if(sum == 0b1101 || sum == 0b0100 || sum == 0b0010 || sum == 0b1011) scrollOffset--;  // Scroll up
+  if(sum == 0b1110 || sum == 0b0111 || sum == 0b0001 || sum == 0b1000) scrollOffset++;  // Scroll down
+
+  lastEncoded = encoded;
+}
 
 // simple display buffer: messages are concatenated with spaces, word-wrapped
 String displayText = "";  // all received messages concatenated
@@ -72,7 +93,7 @@ void appendMessage(const String& msg) {
   }
 }
 
-// word-wrap the display text and show last lines that fit on screen
+// word-wrap the display text and show lines based on scroll position
 void redrawAll() {
   display.clear();
   display.setTextAlignment(TEXT_ALIGN_LEFT);
@@ -84,11 +105,11 @@ void redrawAll() {
   const int maxC = maxCharsPerLine();
 
   // Word-wrap the entire display text
-  String lines[20];  // temp array for wrapped lines
+  String lines[50];  // temp array for wrapped lines (increased for scrolling)
   int lineCount = 0;
   
   int pos = 0;
-  while (pos < displayText.length() && lineCount < 20) {
+  while (pos < displayText.length() && lineCount < 50) {
     int end = min(pos + maxC, (int)displayText.length());
     
     // Try to break at word boundary if not at end
@@ -109,13 +130,27 @@ void redrawAll() {
     if (pos < displayText.length() && displayText[pos] == ' ') pos++;
   }
 
-  // Draw last N lines that fit on screen
-  int start = max(0, lineCount - maxLines);
+  // Constrain scroll offset to valid range
+  int maxScroll = max(0, lineCount - maxLines);
+  scrollOffset = constrain(scrollOffset, 0, maxScroll);
+  
+  // Calculate which lines to show based on scroll position
+  // scrollOffset = 0 means show the LAST lines (newest at bottom)
+  // scrollOffset > 0 means scroll up to see older messages
+  int start = max(0, lineCount - maxLines - scrollOffset);
   int y = 0;
-  for (int i = start; i < lineCount; ++i) {
+  for (int i = start; i < min(start + maxLines, lineCount); ++i) {
     display.drawString(0, y, lines[i]);
     y += h;
     if (y >= H) break;
+  }
+
+  // Show scroll indicator if there are more lines
+  if (lineCount > maxLines) {
+    // Draw scroll bar on right edge
+    int barHeight = (H * maxLines) / lineCount;
+    int barY = (H - barHeight) * scrollOffset / maxScroll;
+    display.drawLine(127, barY, 127, barY + barHeight);
   }
 
   display.display();
@@ -155,9 +190,27 @@ void setup() {
   display.clear();
   display.display();
   Serial.println("RX ready - initialization messages cleared");
+  
+  // Setup encoder for scrolling
+  pinMode(pinA, INPUT_PULLUP);
+  pinMode(pinB, INPUT_PULLUP);
+  int MSB = digitalRead(pinA);
+  int LSB = digitalRead(pinB);
+  lastEncoded = (MSB << 1) | LSB;
+  attachInterrupt(digitalPinToInterrupt(pinA), handleEncoder, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(pinB), handleEncoder, CHANGE);
+  Serial.println("Encoder initialized for scrolling");
 }
 
 void loop() {
+  static int lastScrollOffset = -1;
+  
+  // Check if scroll position changed and redraw
+  if (scrollOffset != lastScrollOffset) {
+    lastScrollOffset = scrollOffset;
+    redrawAll();
+  }
+  
   String msg;
   int state = radio.receive(msg);          // ~500ms wait for a packet
   if (state == RADIOLIB_ERR_NONE) {
@@ -171,6 +224,7 @@ void loop() {
 
     // add message to display text
     appendMessage(msg);
+    scrollOffset = 0;  // Reset scroll to bottom when new message arrives
     redrawAll();
 
     // ACK back w/ metrics (TX parses these)
