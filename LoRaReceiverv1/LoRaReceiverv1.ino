@@ -1,5 +1,5 @@
 // ===== RX: Heltec WiFi LoRa 32 V3 (ESP32-S3 + SX1262) =====
-// v2 - Fixed radio state management and message handling
+// v2.1 - Potentiometer scroll, newest message on top
 #include <Arduino.h>
 #include <Wire.h>
 #include <SPI.h>
@@ -7,25 +7,23 @@
 #include <RadioLib.h>
 
 // ---------- CONFIG ----------
-const uint8_t  OLED_BRIGHTNESS = 128;  // 0..255
-const bool     AUTO_HIDE       = false; // Disable auto-hide for debugging
-const uint32_t HIDE_AFTER_MS   = 30000;
+const uint8_t  OLED_BRIGHTNESS = 128;
 const int      FONT_PX         = 10;
 const bool     WRAP_TEXT       = true;
+const int      MAX_SCROLL      = 10;  // Scroll range (adjust for sensitivity)
 
 // ---------- RADIO CONFIG (MUST MATCH TX) ----------
 const float FREQ_MHZ = 915.0;
 const int   SF       = 10;
 const float BW_KHZ   = 125.0;
 const int   CR       = 5;
-const uint8_t SYNC_WORD = 0x12;  // LoRa default sync word
+const uint8_t SYNC_WORD = 0x12;
 const int   PREAMBLE_LEN = 8;
 
-// ---------- ENCODER PINS ----------
-const int pinA = 40;
-const int pinB = 4;
-volatile int scrollOffset = 0;
-volatile int lastEncoded = 0;
+// ---------- POTENTIOMETER ----------
+const int potPin = 4;  // GPIO 4 for potentiometer
+int scrollOffset = 0;
+int lastPotValue = -1;
 
 // Heltec V3 SX1262 pins
 SX1262 radio = new Module(8, 14, 12, 13);
@@ -36,23 +34,14 @@ static SSD1306Wire display(0x3c, 500000, SDA_OLED, SCL_OLED, GEOMETRY_128_64, RS
 void VextON()  { pinMode(Vext, OUTPUT); digitalWrite(Vext, LOW); }
 void VextOFF() { pinMode(Vext, OUTPUT); digitalWrite(Vext, HIGH); }
 
-// Display buffer
-String displayText = "";
+// Message storage - store individual messages for proper ordering
+const int MAX_MESSAGES = 50;
+String messages[MAX_MESSAGES];
+int messageCount = 0;
+
 uint32_t lastDraw = 0;
 int lastRSSI = 0;
 float lastSNR = 0;
-uint32_t msgCount = 0;
-
-// ---------- ENCODER ISR ----------
-void IRAM_ATTR handleEncoder() {
-  int MSB = digitalRead(pinA);
-  int LSB = digitalRead(pinB);
-  int encoded = (MSB << 1) | LSB;
-  int sum = (lastEncoded << 2) | encoded;
-  if (sum == 0b1101 || sum == 0b0100 || sum == 0b0010 || sum == 0b1011) scrollOffset--;
-  if (sum == 0b1110 || sum == 0b0111 || sum == 0b0001 || sum == 0b1000) scrollOffset++;
-  lastEncoded = encoded;
-}
 
 int lineHeight() { return FONT_PX == 16 ? 16 : (FONT_PX == 24 ? 24 : 12); }
 int maxCharsPerLine() { return FONT_PX == 16 ? 12 : (FONT_PX == 24 ? 8 : 20); }
@@ -63,55 +52,76 @@ void setFont() {
   else display.setFont(ArialMT_Plain_10);
 }
 
-void appendMessage(const String& msg) {
-  if (displayText.length() > 0) {
-    displayText += WRAP_TEXT ? " " : "\n";
+void addMessage(const String& msg) {
+  // Shift messages if full
+  if (messageCount >= MAX_MESSAGES) {
+    for (int i = 0; i < MAX_MESSAGES - 1; i++) {
+      messages[i] = messages[i + 1];
+    }
+    messageCount = MAX_MESSAGES - 1;
   }
-  displayText += msg;
-  if (displayText.length() > 500) {
-    displayText = displayText.substring(displayText.length() - 500);
-  }
+  messages[messageCount++] = msg;
 }
 
 void redrawAll() {
   display.clear();
   display.setTextAlignment(TEXT_ALIGN_LEFT);
-  setFont();
-
-  const int H = 64, h = lineHeight(), maxLines = H / h, maxC = maxCharsPerLine();
-  String lines[50];
+  
+  // Calculate layout (full screen for scrollable content)
+  const int h = lineHeight();
+  const int maxLines = 64 / h;  // All lines available (5 lines at 10px font)
+  const int maxC = maxCharsPerLine();
+  
+  // Build display lines from messages (newest first!)
+  String lines[100];
   int lineCount = 0;
   
-  int pos = 0;
-  while (pos < (int)displayText.length() && lineCount < 50) {
-    int end = min(pos + maxC, (int)displayText.length());
-    if (end < (int)displayText.length() && displayText[end] != ' ') {
-      int lastSpace = displayText.lastIndexOf(' ', end);
-      if (lastSpace > pos) end = lastSpace;
+  // Process messages in REVERSE order (newest first)
+  for (int m = messageCount - 1; m >= 0 && lineCount < 100; m--) {
+    String msg = messages[m];
+    
+    if (WRAP_TEXT) {
+      // Word wrap this message
+      int pos = 0;
+      while (pos < (int)msg.length() && lineCount < 100) {
+        int end = min(pos + maxC, (int)msg.length());
+        if (end < (int)msg.length() && msg[end] != ' ') {
+          int lastSpace = msg.lastIndexOf(' ', end);
+          if (lastSpace > pos) end = lastSpace;
+        }
+        String line = msg.substring(pos, end);
+        line.trim();
+        if (line.length() > 0) lines[lineCount++] = line;
+        pos = end;
+        if (pos < (int)msg.length() && msg[pos] == ' ') pos++;
+      }
+    } else {
+      // No wrap - one line per message (truncate if needed)
+      lines[lineCount++] = msg.substring(0, maxC);
     }
-    String line = displayText.substring(pos, end);
-    line.trim();
-    if (line.length() > 0) lines[lineCount++] = line;
-    pos = end;
-    if (pos < (int)displayText.length() && displayText[pos] == ' ') pos++;
   }
-
+  
+  // Add status line as the LAST scrollable line
+  char status[32];
+  snprintf(status, sizeof(status), "Msgs:%d RSSI:%d Scr:%d", messageCount, lastRSSI, scrollOffset);
+  if (lineCount < 100) {
+    lines[lineCount++] = String(status);
+  }
+  
+  // Constrain scroll to actual content
   int maxScroll = max(0, lineCount - maxLines);
   scrollOffset = constrain(scrollOffset, 0, maxScroll);
   
-  int start = max(0, lineCount - maxLines - scrollOffset);
+  // Draw lines (from top)
+  // scrollOffset=0 means show newest messages at top
+  // Scroll to bottom to see the status line
+  setFont();
   int y = 0;
-  for (int i = start; i < min(start + maxLines, lineCount); ++i) {
+  for (int i = scrollOffset; i < min(scrollOffset + maxLines, lineCount); i++) {
     display.drawString(0, y, lines[i]);
     y += h;
   }
-
-  // Status bar at bottom
-  display.setFont(ArialMT_Plain_10);
-  char status[32];
-  snprintf(status, sizeof(status), "Msgs:%lu RSSI:%d", (unsigned long)msgCount, lastRSSI);
-  display.drawString(0, 54, status);
-
+  
   display.display();
   lastDraw = millis();
 }
@@ -138,19 +148,13 @@ void initRadio() {
   radio.setCRC(true);
   radio.standby();
   
-  Serial.println("Radio initialized:");
-  Serial.print("  Freq: "); Serial.print(FREQ_MHZ); Serial.println(" MHz");
-  Serial.print("  SF: "); Serial.println(SF);
-  Serial.print("  BW: "); Serial.print(BW_KHZ); Serial.println(" kHz");
-  Serial.print("  CR: 4/"); Serial.println(CR);
-  Serial.print("  Sync: 0x"); Serial.println(SYNC_WORD, HEX);
-  Serial.print("  Preamble: "); Serial.println(PREAMBLE_LEN);
+  Serial.println("Radio initialized");
 }
 
 void setup() {
   Serial.begin(115200);
   delay(1000);
-  Serial.println("\n\n=== LoRa RX v2 Starting ===");
+  Serial.println("\n\n=== LoRa RX v2.1 Starting ===");
 
   VextON();
   delay(100);
@@ -158,22 +162,19 @@ void setup() {
   display.setContrast(OLED_BRIGHTNESS);
   display.clear();
   display.setFont(ArialMT_Plain_10);
-  display.drawString(0, 0, "LoRa RX v2");
-  display.drawString(0, 12, "Initializing...");
+  display.drawString(0, 0, "LoRa RX v2.1");
+  display.drawString(0, 12, "Pot scroll mode");
   display.display();
 
   initRadio();
 
-  // Encoder setup
-  pinMode(pinA, INPUT_PULLUP);
-  pinMode(pinB, INPUT_PULLUP);
-  lastEncoded = (digitalRead(pinA) << 1) | digitalRead(pinB);
-  attachInterrupt(digitalPinToInterrupt(pinA), handleEncoder, CHANGE);
-  attachInterrupt(digitalPinToInterrupt(pinB), handleEncoder, CHANGE);
-
-  displayText = "";
-  appendMessage("RX Ready");
-  appendMessage("Waiting...");
+  // Potentiometer setup
+  analogReadResolution(12);
+  analogSetAttenuation(ADC_11db);
+  pinMode(potPin, INPUT);
+  
+  // Add initial message
+  addMessage("RX Ready - scroll test");
   redrawAll();
   
   Serial.println("=== RX Ready ===\n");
@@ -181,7 +182,27 @@ void setup() {
 
 void loop() {
   static int lastScrollOffset = -1;
-  static uint32_t lastDebug = 0;
+  static uint32_t lastPotRead = 0;
+  
+  // Read potentiometer every 50ms
+  if (millis() - lastPotRead > 50) {
+    lastPotRead = millis();
+    
+    int potValue = analogRead(potPin);
+    
+    // Only update if pot moved significantly (reduce jitter)
+    if (abs(potValue - lastPotValue) > 50) {
+      lastPotValue = potValue;
+      
+      // Map pot to scroll: 0-4095 -> 0-MAX_SCROLL
+      // Pot at 0 = scroll 0 (newest at top)
+      // Pot at max = scroll down to older messages
+      scrollOffset = map(potValue, 0, 4095, 0, MAX_SCROLL);
+      
+      Serial.print("Pot: "); Serial.print(potValue);
+      Serial.print(" -> Scroll: "); Serial.println(scrollOffset);
+    }
+  }
   
   // Redraw on scroll change
   if (scrollOffset != lastScrollOffset) {
@@ -189,69 +210,44 @@ void loop() {
     redrawAll();
   }
   
-  // Try to receive (blocking with timeout)
-  String msg;
-  int state = radio.receive(msg, 100);  // 100ms timeout
+  // Try to receive
+  uint8_t rxBuffer[64];
+  memset(rxBuffer, 0, sizeof(rxBuffer));
+  int state = radio.receive(rxBuffer, 50);
   
-  if (state == RADIOLIB_ERR_NONE && msg.length() > 0) {
-    // Got a message!
-    lastRSSI = radio.getRSSI();
+  if (state == RADIOLIB_ERR_NONE) {
+    size_t rxLen = radio.getPacketLength();
+    lastRSSI = radio.getRSSI(true);
     lastSNR = radio.getSNR();
-    msgCount++;
     
-    Serial.println("================");
-    Serial.print("RX MSG: '"); Serial.print(msg); Serial.println("'");
-    Serial.print("  Length: "); Serial.println(msg.length());
-    Serial.print("  RSSI: "); Serial.print(lastRSSI); Serial.println(" dBm");
-    Serial.print("  SNR: "); Serial.print(lastSNR); Serial.println(" dB");
-    
-    // Print hex dump for debugging
-    Serial.print("  Hex: ");
-    for (unsigned int i = 0; i < msg.length(); i++) {
-      Serial.print((uint8_t)msg[i], HEX);
-      Serial.print(" ");
+    if (rxLen > 0 && rxLen <= 50) {
+      String msg = "";
+      for (size_t i = 0; i < rxLen; i++) {
+        msg += (char)rxBuffer[i];
+      }
+      
+      // Send ACK
+      radio.standby();
+      delay(80);
+      String ack = "A," + String(lastRSSI) + "," + String(lastSNR, 1);
+      int ackState = radio.transmit(ack);
+      radio.standby();
+      delay(10);
+      
+      Serial.println("================");
+      Serial.print("RX: '"); Serial.print(msg); Serial.println("'");
+      Serial.print("  RSSI: "); Serial.print(lastRSSI); Serial.println(" dBm");
+      Serial.print("  ACK: "); Serial.println(ackState == RADIOLIB_ERR_NONE ? "OK" : "FAIL");
+      Serial.println("================");
+      
+      // Add message (newest will be at top)
+      addMessage(msg);
+      
+      // Reset scroll to top when new message arrives
+      scrollOffset = 0;
+      lastScrollOffset = -1;
+      lastPotValue = -1;  // Force pot re-read
+      redrawAll();
     }
-    Serial.println();
-    
-    // Display the message
-    appendMessage(msg);
-    scrollOffset = 0;
-    lastScrollOffset = -1;
-    redrawAll();
-    
-    // Send ACK
-    radio.standby();
-    delay(20);
-    
-    String ack = "A," + String(lastRSSI) + "," + String(lastSNR, 1);
-    Serial.print("Sending ACK: '"); Serial.print(ack); Serial.println("'");
-    
-    int ackState = radio.transmit(ack);
-    if (ackState == RADIOLIB_ERR_NONE) {
-      Serial.println("ACK sent OK");
-    } else {
-      Serial.print("ACK FAILED: "); Serial.println(ackState);
-    }
-    
-    // Back to standby, ready for next receive
-    radio.standby();
-    delay(10);
-    Serial.println("================\n");
-  }
-  
-  // Debug output every 10 seconds
-  if (millis() - lastDebug > 10000) {
-    lastDebug = millis();
-    Serial.print("Status: msgs="); Serial.print(msgCount);
-    Serial.print(" scroll="); Serial.print(scrollOffset);
-    Serial.print(" pinA="); Serial.print(digitalRead(pinA));
-    Serial.print(" pinB="); Serial.println(digitalRead(pinB));
-  }
-  
-  // Auto-hide
-  if (AUTO_HIDE && lastDraw && (millis() - lastDraw > HIDE_AFTER_MS)) {
-    display.clear();
-    display.display();
-    lastDraw = 0;
   }
 }
