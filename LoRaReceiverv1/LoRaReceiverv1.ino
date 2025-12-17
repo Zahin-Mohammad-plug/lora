@@ -63,7 +63,7 @@ void addMessage(const String& msg) {
   messages[messageCount++] = msg;
 }
 
-void redrawAll() {
+int redrawAll() {
   display.clear();
   display.setTextAlignment(TEXT_ALIGN_LEFT);
   
@@ -81,7 +81,17 @@ void redrawAll() {
     String msg = messages[m];
     
     if (WRAP_TEXT) {
-      // Word wrap this message
+      // Wrap mode: Try to append to last line if it fits, otherwise wrap
+      if (lineCount > 0) {
+        // Try to append to last line
+        String candidate = lines[lineCount - 1] + " " + msg;
+        if (candidate.length() <= maxC) {
+          // Fits on last line!
+          lines[lineCount - 1] = candidate;
+          continue;
+        }
+      }
+      // Doesn't fit or no previous line - word wrap this message
       int pos = 0;
       while (pos < (int)msg.length() && lineCount < 100) {
         int end = min(pos + maxC, (int)msg.length());
@@ -124,6 +134,8 @@ void redrawAll() {
   
   display.display();
   lastDraw = millis();
+  
+  return lineCount;  // Return total line count for ACK
 }
 
 void initRadio() {
@@ -175,7 +187,7 @@ void setup() {
   
   // Add initial message
   addMessage("RX Ready - scroll test");
-  redrawAll();
+  (void)redrawAll();  // Ignore return value on init
   
   Serial.println("=== RX Ready ===\n");
 }
@@ -207,7 +219,7 @@ void loop() {
   // Redraw on scroll change
   if (scrollOffset != lastScrollOffset) {
     lastScrollOffset = scrollOffset;
-    redrawAll();
+    (void)redrawAll();  // Ignore return value on scroll
   }
   
   // Try to receive
@@ -226,20 +238,6 @@ void loop() {
         msg += (char)rxBuffer[i];
       }
       
-      // Send ACK
-      radio.standby();
-      delay(80);
-      String ack = "A," + String(lastRSSI) + "," + String(lastSNR, 1);
-      int ackState = radio.transmit(ack);
-      radio.standby();
-      delay(10);
-      
-      Serial.println("================");
-      Serial.print("RX: '"); Serial.print(msg); Serial.println("'");
-      Serial.print("  RSSI: "); Serial.print(lastRSSI); Serial.println(" dBm");
-      Serial.print("  ACK: "); Serial.println(ackState == RADIOLIB_ERR_NONE ? "OK" : "FAIL");
-      Serial.println("================");
-      
       // Add message (newest will be at top)
       addMessage(msg);
       
@@ -247,7 +245,26 @@ void loop() {
       scrollOffset = 0;
       lastScrollOffset = -1;
       lastPotValue = -1;  // Force pot re-read
-      redrawAll();
+      
+      // Redraw to get line count, then send ACK with counts
+      int totalLineCount = redrawAll();
+      
+      // Send ACK with message count and line count
+      radio.standby();
+      delay(80);
+      String ack = "A," + String(lastRSSI) + "," + String(lastSNR, 1) + 
+                   "," + String(messageCount) + "," + String(totalLineCount);
+      int ackState = radio.transmit(ack);
+      radio.standby();
+      delay(10);
+      
+      Serial.println("================");
+      Serial.print("RX: '"); Serial.print(msg); Serial.println("'");
+      Serial.print("  RSSI: "); Serial.print(lastRSSI); Serial.println(" dBm");
+      Serial.print("  Msgs: "); Serial.print(messageCount);
+      Serial.print("  Lines: "); Serial.println(totalLineCount);
+      Serial.print("  ACK: "); Serial.println(ackState == RADIOLIB_ERR_NONE ? "OK" : "FAIL");
+      Serial.println("================");
     }
   }
 }

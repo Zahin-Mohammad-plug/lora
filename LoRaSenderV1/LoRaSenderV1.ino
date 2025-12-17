@@ -38,9 +38,13 @@ int lastAckRSSI = 0;
 float lastAckSNR = 0.0;
 uint32_t lastRTTms = 0;
 int lastTxState = 0;
+int rxReportedMsgCount = 0;  // From RX ACK
+int rxReportedLineCount = 0;  // From RX ACK
 
-// RX Screen simulation
-String rxScreenText = "";
+// RX Screen simulation - match RX structure
+const int MAX_RX_MESSAGES = 50;
+String rxMessages[MAX_RX_MESSAGES];
+int rxMessageCount = 0;
 bool rxWrapMode = true;
 
 // Message history
@@ -67,14 +71,15 @@ void addToHistory(const String& msg, bool sent, bool acked) {
 }
 
 void updateRxScreen(const String& msg) {
-  if (rxScreenText.length() > 0) {
-    rxScreenText += rxWrapMode ? " " : "\n";
+  // Add message to array (newest at end, like RX)
+  if (rxMessageCount >= MAX_RX_MESSAGES) {
+    // Shift messages
+    for (int i = 0; i < MAX_RX_MESSAGES - 1; i++) {
+      rxMessages[i] = rxMessages[i + 1];
+    }
+    rxMessageCount = MAX_RX_MESSAGES - 1;
   }
-  rxScreenText += msg;
-  // Keep ~500 chars like RX does
-  if (rxScreenText.length() > 500) {
-    rxScreenText = rxScreenText.substring(rxScreenText.length() - 500);
-  }
+  rxMessages[rxMessageCount++] = msg;
 }
 
 void drawStatus(const String& stat) {
@@ -132,7 +137,7 @@ button:hover{background:#0056b3}
 button:disabled{background:#666;cursor:not-allowed}
 label{display:flex;align-items:center;gap:6px;cursor:pointer}
 input[type=checkbox]{width:18px;height:18px;cursor:pointer}
-.rx-preview{background:#000;border:3px solid #333;border-radius:4px;padding:8px;margin:12px 0;font-family:monospace;font-size:11px;color:#0f0;height:64px;overflow:hidden;line-height:1.3;white-space:pre-wrap;word-wrap:break-word}
+.rx-preview{background:#000;border:3px solid #333;border-radius:4px;padding:8px;margin:12px 0;font-family:monospace;font-size:11px;color:#0f0;max-height:300px;overflow-y:auto;line-height:1.3;white-space:pre-wrap;word-wrap:break-word}
 .rx-preview.nowrap{white-space:pre;overflow-x:auto}
 .status{padding:12px;margin:12px 0;border-radius:4px;font-weight:bold}
 .status.ok{background:#1a4d1a;color:#4f4}
@@ -163,9 +168,7 @@ input[type=checkbox]{width:18px;height:18px;cursor:pointer}
 <div id=status class='status ok'>Ready to send</div>
 
 <h3>RX Screen Preview (128x64 OLED)</h3>
-<div id=rxPreview class=rx-preview>)");
-  h += escapeJson(rxScreenText);
-  h += F(R"(</div>
+<div id=rxPreview class=rx-preview>RX Ready</div>
 
 <h3>Stats</h3>
 <div class=stats>
@@ -208,9 +211,16 @@ const wrapMode = document.getElementById('wrapMode');
 const autoSend = document.getElementById('autoSend');
 const sendBtn = document.getElementById('sendBtn');
 
-let rxText = ')");
-  h += escapeJson(rxScreenText);
-  h += F(R"(';
+let rxMessages = [)");
+  // Build JSON array of messages
+  h += "\"";
+  for (int i = 0; i < rxMessageCount; i++) {
+    if (i > 0) h += "\",\"";
+    h += escapeJson(rxMessages[i]);
+  }
+  h += F(R"("];
+let rxMsgCount = 0;  // RX's reported message count
+let rxLineCount = 0;  // RX's reported line count
 
 msgBox.focus();
 msgBox.addEventListener('input', () => {
@@ -222,40 +232,88 @@ msgBox.addEventListener('keydown', e => {
 });
 
 function updatePreview() {
-  rxPreview.className = 'rx-preview' + (wrapMode.checked ? '' : ' nowrap');
-  // Simulate how text would appear on RX (128px wide = ~20 chars)
-  const MAX_CHARS = 20;
-  const MAX_LINES = 5;
+  // RX always uses wrap mode (WRAP_TEXT=true), so preview should always wrap
+  rxPreview.className = 'rx-preview';
+  const MAX_CHARS = 20;  // 128px OLED = ~20 chars per line
+  const MAX_VISIBLE = 5; // 5 lines visible (64px / 10px font = 5-6 lines)
   
-  let text = rxText;
+  // Build lines from messages (newest first, like RX)
+  let allLines = [];
+  
+  // Process messages in REVERSE order (newest first)
+  let messagesToShow = [...rxMessages];
   if (msgBox.value.trim()) {
-    let pending = msgBox.value.trim().substring(0, MAX_LEN);
-    text += (text ? (wrapMode.checked ? ' ' : '\n') : '') + pending;
+    messagesToShow.push(msgBox.value.trim().substring(0, MAX_LEN));
   }
   
-  let lines = [];
-  if (wrapMode.checked) {
-    // Word wrap mode - break at spaces when possible
-    let pos = 0;
-    while (pos < text.length && lines.length < 50) {
-      let end = Math.min(pos + MAX_CHARS, text.length);
-      // Find last space if we're not at the end
-      if (end < text.length && text[end] !== ' ') {
-        let lastSpace = text.lastIndexOf(' ', end);
-        if (lastSpace > pos) end = lastSpace;
+  // RX always uses wrap mode, so preview should always wrap (ignore checkbox)
+  for (let m = messagesToShow.length - 1; m >= 0; m--) {
+    let msg = messagesToShow[m];
+    
+    // Always use wrap mode to match RX behavior
+    {
+      // Wrap mode: Try to append to last line if it fits, otherwise wrap
+      if (allLines.length > 0) {
+        // Try to append to last line
+        let candidate = allLines[allLines.length - 1] + ' ' + msg;
+        if (candidate.length <= MAX_CHARS) {
+          // Fits on last line!
+          allLines[allLines.length - 1] = candidate;
+          continue;
+        }
       }
-      let line = text.substring(pos, end).trim();
-      if (line) lines.push(line);
-      pos = end;
-      if (pos < text.length && text[pos] === ' ') pos++;
+      // Doesn't fit or no previous line - word wrap this message
+      let pos = 0;
+      while (pos < msg.length && allLines.length < 100) {
+        let end = Math.min(pos + MAX_CHARS, msg.length);
+        // Find last space if not at end
+        if (end < msg.length && msg[end] !== ' ') {
+          let lastSpace = msg.lastIndexOf(' ', end);
+          if (lastSpace > pos) end = lastSpace;
+        }
+        let line = msg.substring(pos, end).trim();
+        if (line) allLines.push(line);
+        pos = end;
+        if (pos < msg.length && msg[pos] === ' ') pos++;
+      }
     }
-  } else {
-    // No wrap - each message on its own line
-    lines = text.split('\n');
   }
   
-  // Show last MAX_LINES (what fits on 64px OLED height)
-  rxPreview.textContent = lines.slice(-MAX_LINES).join('\n');
+  // Add status line at the end (like RX does)
+  let msgCount = rxMsgCount > 0 ? rxMsgCount : (rxMessages.length + (msgBox.value.trim() ? 1 : 0));
+  allLines.push('Msgs:' + msgCount + ' RSSI:-- Scr:0');
+  
+  // Use RX's reported line count if available, otherwise use calculated
+  let totalLines = rxLineCount > 0 ? rxLineCount : allLines.length;
+  
+  // Limit to actual lines (not all 50) - but show all existing lines
+  if (allLines.length < totalLines) {
+    // Pad with empty lines if RX reports more (shouldn't happen, but handle it)
+    while (allLines.length < totalLines && allLines.length < 50) {
+      allLines.push('');
+    }
+  } else if (allLines.length > totalLines && totalLines > 0) {
+    // Trim to RX's reported count
+    allLines = allLines.slice(0, totalLines);
+  }
+  
+  // Show ALL lines (up to 50) with color coding
+  // Green for visible (first 5 - newest at top), yellow for older (scrollable)
+  let html = '';
+  // Newest lines are at index 0, so visible lines are 0 to MAX_VISIBLE-1
+  let visibleEnd = Math.min(MAX_VISIBLE, allLines.length);
+  
+  for (let i = 0; i < allLines.length && i < 50; i++) {
+    let line = allLines[i];
+    let isVisible = i < visibleEnd;  // First 5 lines are visible (newest)
+    let color = isVisible ? '#0f0' : '#ff0';  // Green for visible, yellow for older
+    // Escape HTML
+    let escaped = line.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    html += '<span style=\"color:' + color + '\">' + escaped + '</span>';
+    if (i < allLines.length - 1 && i < 49) html += '<br>';
+  }
+  
+  rxPreview.innerHTML = html;
 }
 
 async function sendMsg() {
@@ -279,9 +337,34 @@ async function sendMsg() {
     const data = await resp.json();
     
     if (data.sent) {
+      // Always add message to local array (optimistic update)
+      if (!rxMessages.includes(toSend)) {
+        rxMessages.push(toSend);
+      }
+      
       if (data.acked) {
         setStatus('✓ Sent + ACK received!', 'ok');
-        rxText = data.rxScreen || rxText;
+        // Update from RX's reported data
+        if (data.rxMsgCount !== undefined) {
+          rxMsgCount = data.rxMsgCount;
+        }
+        if (data.rxLineCount !== undefined) {
+          rxLineCount = data.rxLineCount;
+        }
+        // Sync with RX's reported message array if provided
+        if (data.rxMessages && Array.isArray(data.rxMessages) && data.rxMessages.length > 0) {
+          // Use RX's message array (most accurate - reflects what RX actually has)
+          rxMessages = data.rxMessages;
+          // Trim to RX's reported count if needed
+          if (rxMsgCount > 0 && rxMessages.length > rxMsgCount) {
+            rxMessages = rxMessages.slice(-rxMsgCount);
+          }
+        } else {
+          // No server array provided - trim local array to RX count if known
+          if (rxMsgCount > 0 && rxMessages.length > rxMsgCount) {
+            rxMessages = rxMessages.slice(-rxMsgCount);
+          }
+        }
       } else {
         setStatus('⏳ Sent but no ACK (RX may have received it)', 'warn');
       }
@@ -438,11 +521,34 @@ void handleSend() {
       Serial.print("Received: '"); Serial.print(ackMsg); Serial.println("'");
       
       if (ackMsg.startsWith("A,")) {
+        // Parse enhanced ACK: "A,RSSI,SNR,MSG_COUNT,LINE_COUNT"
         int c1 = ackMsg.indexOf(',');
         int c2 = ackMsg.indexOf(',', c1 + 1);
+        int c3 = ackMsg.indexOf(',', c2 + 1);
+        int c4 = ackMsg.indexOf(',', c3 + 1);
+        
         if (c1 > 0 && c2 > c1) {
           lastAckRSSI = ackMsg.substring(c1 + 1, c2).toInt();
-          lastAckSNR = ackMsg.substring(c2 + 1).toFloat();
+          if (c3 > c2) {
+            lastAckSNR = ackMsg.substring(c2 + 1, c3).toFloat();
+            if (c4 > c3) {
+              // Enhanced ACK with counts
+              rxReportedMsgCount = ackMsg.substring(c3 + 1, c4).toInt();
+              rxReportedLineCount = ackMsg.substring(c4 + 1).toInt();
+              Serial.print("Enhanced ACK: msgs="); Serial.print(rxReportedMsgCount);
+              Serial.print(" lines="); Serial.println(rxReportedLineCount);
+            } else {
+              // Old format - just RSSI and SNR
+              lastAckSNR = ackMsg.substring(c2 + 1).toFloat();
+              rxReportedMsgCount = 0;
+              rxReportedLineCount = 0;
+            }
+          } else {
+            // Fallback for old format
+            lastAckSNR = ackMsg.substring(c2 + 1).toFloat();
+            rxReportedMsgCount = 0;
+            rxReportedLineCount = 0;
+          }
           ack = true;
           Serial.println("Valid ACK!");
         }
@@ -455,7 +561,7 @@ void handleSend() {
   lastRTTms = millis() - t0;
   lastTxState = st;
   if (ack) pktAck++;
-  
+
   addToHistory(msg, (st == RADIOLIB_ERR_NONE), ack);
   
   // Update RX screen simulation
@@ -466,6 +572,14 @@ void handleSend() {
   String stat = (st == RADIOLIB_ERR_NONE) ? (ack ? "ACK" : "NoACK") : "FAIL";
   drawStatus(stat);
   
+  // Build JSON array of messages
+  String rxMessagesJson = "[";
+  for (int i = 0; i < rxMessageCount; i++) {
+    if (i > 0) rxMessagesJson += ",";
+    rxMessagesJson += "\"" + escapeJson(rxMessages[i]) + "\"";
+  }
+  rxMessagesJson += "]";
+  
   // Send response with all data
   String json = "{\"sent\":" + String(st == RADIOLIB_ERR_NONE ? "true" : "false") + 
                 ",\"acked\":" + String(ack ? "true" : "false") +
@@ -474,7 +588,9 @@ void handleSend() {
                 ",\"pktAck\":" + String(pktAck) +
                 ",\"rssi\":" + String(lastAckRSSI) +
                 ",\"rtt\":" + String(lastRTTms) +
-                ",\"rxScreen\":\"" + escapeJson(rxScreenText) + "\"}";
+                ",\"rxMsgCount\":" + String(rxReportedMsgCount) +
+                ",\"rxLineCount\":" + String(rxReportedLineCount) +
+                ",\"rxMessages\":" + rxMessagesJson + "}";
   
   server.sendHeader("Access-Control-Allow-Origin", "*");
   server.send(200, "application/json", json);
