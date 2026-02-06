@@ -11,9 +11,11 @@
 // Heltec V3 SX1262 pins
 SX1262 radio = new Module(8, 14, 12, 13);
 
-// Wi-Fi creds
-const char* SSID = "logi_mouse_02";
-const char* PASS = "gg1234567";
+// Wi-Fi creds: primary first, fallback if connect/reconnect fails
+const char* SSID_PRIMARY   = "LG_dock";
+const char* PASS_PRIMARY   = "gg1234567";
+const char* SSID_FALLBACK  = "logi_mouse_02";
+const char* PASS_FALLBACK  = "gg1234567";
 
 // OLED
 static SSD1306Wire display(0x3c, 500000, SDA_OLED, SCL_OLED, GEOMETRY_128_64, RST_OLED);
@@ -443,6 +445,48 @@ void handleStatus() {
   server.send(200, "application/json", json);
 }
 
+// Try primary WiFi, then fallback. Returns true if connected.
+bool connectWiFi() {
+  const unsigned long timeoutMs = 15000;  // 15s per network
+  // Try primary first
+  Serial.print("Trying primary: ");
+  Serial.println(SSID_PRIMARY);
+  WiFi.disconnect();
+  delay(100);
+  WiFi.begin(SSID_PRIMARY, PASS_PRIMARY);
+  unsigned long t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && (millis() - t0) < timeoutMs) {
+    delay(500);
+    Serial.print(".");
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println();
+    Serial.print("Connected to primary. IP: ");
+    Serial.println(WiFi.localIP());
+    return true;
+  }
+  Serial.println(" failed.");
+  // Fallback
+  Serial.print("Trying fallback: ");
+  Serial.println(SSID_FALLBACK);
+  WiFi.disconnect();
+  delay(100);
+  WiFi.begin(SSID_FALLBACK, PASS_FALLBACK);
+  t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && (millis() - t0) < timeoutMs) {
+    delay(500);
+    Serial.print(".");
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println();
+    Serial.print("Connected to fallback. IP: ");
+    Serial.println(WiFi.localIP());
+    return true;
+  }
+  Serial.println(" failed.");
+  return false;
+}
+
 void initRadio() {
   Serial.println("Initializing radio...");
   SPI.begin(9, 11, 10, 8);
@@ -615,13 +659,12 @@ void setup() {
   display.display();
 
   WiFi.mode(WIFI_STA);
-  WiFi.begin(SSID, PASS);
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
+  if (!connectWiFi()) {
+    Serial.println("WiFi: both networks failed.");
+    display.drawString(0, 24, "WiFi FAIL");
+    display.display();
+    while (true) delay(5000);  // Retry forever or halt
   }
-  Serial.println();
-  Serial.print("Connected! IP: "); Serial.println(WiFi.localIP());
 
   server.on("/", HTTP_GET, handleRoot);
   server.on("/send", HTTP_POST, handleSend);
@@ -636,6 +679,24 @@ void setup() {
   Serial.print("Web UI: http://"); Serial.println(WiFi.localIP());
 }
 
+// Last WiFi check time for reconnect
+uint32_t lastWifiCheck = 0;
+const uint32_t WIFI_CHECK_INTERVAL_MS = 5000;
+
 void loop() {
   server.handleClient();
+
+  // If WiFi drops, try primary then fallback again
+  if (millis() - lastWifiCheck >= WIFI_CHECK_INTERVAL_MS) {
+    lastWifiCheck = millis();
+    if (WiFi.status() != WL_CONNECTED) {
+      Serial.println("WiFi lost, reconnecting...");
+      drawStatus("Reconnecting...");
+      if (connectWiFi()) {
+        drawStatus("Ready");
+        Serial.print("Web UI: http://");
+        Serial.println(WiFi.localIP());
+      }
+    }
+  }
 }
